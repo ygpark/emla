@@ -1,4 +1,4 @@
-module emla
+module github.com/ygpark/emla
 
 go 1.23.5
 
