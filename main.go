@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/mail"
 	"net/url"
@@ -33,18 +34,24 @@ type EmailRecord struct {
 }
 
 func main() {
+
 	var jsonOutput bool
 	var csvOutput bool
 	var recursive bool
+	var htmlOutDir string
+	var renameByHeader bool
+	var renameByHeaderTo string
 
 	flag.BoolVar(&jsonOutput, "json", false, "JSON 형식으로 출력")
 	flag.BoolVar(&csvOutput, "csv", false, "CSV 형식으로 출력")
 	flag.BoolVar(&recursive, "r", false, "재귀적으로 디렉토리 탐색")
+	flag.StringVar(&htmlOutDir, "eml2html-to", "", "지정한 경로에 EML 파일을 HTML로 변환하여 저장")
+	flag.BoolVar(&renameByHeader, "rename-by-header", false, "EML 파일의 날짜-제목 기반으로 파일명을 변경")
+	flag.StringVar(&renameByHeaderTo, "rename-by-header-to", "", "지정한 경로에 EML 파일을 복사한 후 날짜-제목 기반으로 파일명을 변경")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "사용법:\n")
-		fmt.Fprintf(os.Stderr, "  %s [-json|-csv] [디렉토리 경로]\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s -r [-json|-csv] [디렉토리 경로]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s [-r] [-json|-csv] [-eml2html PATH] [-rename-by-header] [-rename-by-header-to PATH] [디렉토리 경로]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -54,26 +61,32 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 기본 출력은 CSV
 	if !jsonOutput && !csvOutput {
-		csvOutput = true // 기본은 CSV 출력
+		csvOutput = true
 	}
 
-	root := flag.Arg(0)
+	inputRoot := flag.Arg(0)
 
 	var records []EmailRecord
 	var err error
 
 	if recursive {
-		records, err = walkDirectory(root)
+		records, err = walkDirectory(inputRoot, htmlOutDir, renameByHeader, renameByHeaderTo)
 	} else {
-		records, err = scanDirectoryOnce(root)
+		records, err = scanDirectoryOnce(inputRoot, htmlOutDir, renameByHeader, renameByHeaderTo)
 	}
 
 	if err != nil {
 		log.Fatalf("[ERROR] 디렉토리 처리 중 오류 발생: %v", err)
 	}
 
-	printOutput(records, jsonOutput, csvOutput)
+	// 옵션 중 하나라도 지정되면 화면에 출력하지 않습니다.
+	if htmlOutDir != "" || renameByHeader || renameByHeaderTo != "" {
+		fmt.Fprintf(os.Stderr, "[DEBUG] 파일 변환 및 재명명 작업 완료. 화면 출력 생략.\n")
+	} else {
+		printOutput(records, jsonOutput, csvOutput)
+	}
 }
 
 func shouldProcessFile(name string) bool {
@@ -81,10 +94,10 @@ func shouldProcessFile(name string) bool {
 	return matched
 }
 
-func walkDirectory(root string) ([]EmailRecord, error) {
+func walkDirectory(inputRoot, htmlOutDir string, renameByHeader bool, renameByHeaderTo string) ([]EmailRecord, error) {
 	var records []EmailRecord
 
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(inputRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -92,10 +105,25 @@ func walkDirectory(root string) ([]EmailRecord, error) {
 			return nil
 		}
 		if shouldProcessFile(d.Name()) {
-			record, err := processEmlFile(path)
+			record, htmlContent, err := processEmlFile(path)
 			if err != nil {
 				log.Printf("[WARN] 파일 처리 실패: %s (%v)", path, err)
 				return nil
+			}
+			if htmlOutDir != "" {
+				if err := writeHtmlFile(path, inputRoot, htmlOutDir, htmlContent); err != nil {
+					log.Printf("[WARN] HTML 파일 생성 실패: %s (%v)", path, err)
+				}
+			}
+			// 우선순위: rename-by-header-to 옵션이 있으면 그 기능 사용, 없으면 in-place rename
+			if renameByHeaderTo != "" {
+				if err := renameFileTo(path, inputRoot, renameByHeaderTo, record); err != nil {
+					log.Printf("[WARN] 파일 복사 재명명 실패: %s (%v)", path, err)
+				}
+			} else if renameByHeader {
+				if err := renameFile(path, record); err != nil {
+					log.Printf("[WARN] 파일 재명명 실패: %s (%v)", path, err)
+				}
 			}
 			records = append(records, record)
 		}
@@ -104,10 +132,10 @@ func walkDirectory(root string) ([]EmailRecord, error) {
 	return records, err
 }
 
-func scanDirectoryOnce(root string) ([]EmailRecord, error) {
+func scanDirectoryOnce(inputRoot, htmlOutDir string, renameByHeader bool, renameByHeaderTo string) ([]EmailRecord, error) {
 	var records []EmailRecord
 
-	entries, err := os.ReadDir(root)
+	entries, err := os.ReadDir(inputRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -117,11 +145,25 @@ func scanDirectoryOnce(root string) ([]EmailRecord, error) {
 			continue
 		}
 		if shouldProcessFile(entry.Name()) {
-			path := filepath.Join(root, entry.Name())
-			record, err := processEmlFile(path)
+			path := filepath.Join(inputRoot, entry.Name())
+			record, htmlContent, err := processEmlFile(path)
 			if err != nil {
 				log.Printf("[WARN] 파일 처리 실패: %s (%v)", path, err)
 				continue
+			}
+			if htmlOutDir != "" {
+				if err := writeHtmlFile(path, inputRoot, htmlOutDir, htmlContent); err != nil {
+					log.Printf("[WARN] HTML 파일 생성 실패: %s (%v)", path, err)
+				}
+			}
+			if renameByHeaderTo != "" {
+				if err := renameFileTo(path, inputRoot, renameByHeaderTo, record); err != nil {
+					log.Printf("[WARN] 파일 복사 재명명 실패: %s (%v)", path, err)
+				}
+			} else if renameByHeader {
+				if err := renameFile(path, record); err != nil {
+					log.Printf("[WARN] 파일 재명명 실패: %s (%v)", path, err)
+				}
 			}
 			records = append(records, record)
 		}
@@ -129,16 +171,16 @@ func scanDirectoryOnce(root string) ([]EmailRecord, error) {
 	return records, nil
 }
 
-func processEmlFile(filePath string) (EmailRecord, error) {
+func processEmlFile(filePath string) (EmailRecord, string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return EmailRecord{}, err
+		return EmailRecord{}, "", err
 	}
 	defer file.Close()
 
 	env, err := enmime.ReadEnvelope(file)
 	if err != nil {
-		return EmailRecord{}, err
+		return EmailRecord{}, "", err
 	}
 
 	header := env.Root.Header
@@ -167,7 +209,7 @@ func processEmlFile(filePath string) (EmailRecord, error) {
 	folder := filepath.Base(filepath.Dir(filePath))
 	originalFile := filepath.Base(filePath)
 
-	return EmailRecord{
+	record := EmailRecord{
 		Folder:       folder,
 		Subject:      subject,
 		FromName:     fromName,
@@ -179,7 +221,85 @@ func processEmlFile(filePath string) (EmailRecord, error) {
 		URLs:         urlList,
 		URLDomains:   strings.Join(urlDomains, "\n"),
 		OriginalFile: originalFile,
-	}, nil
+	}
+	return record, env.HTML, nil
+}
+
+// renameFile는 원본 파일의 이름을 in-place로 변경합니다.
+func renameFile(filePath string, record EmailRecord) error {
+	dir := filepath.Dir(filePath)
+	newTime := formatTime(record.SentDate)
+	newName := sanitizeFilename(fmt.Sprintf("%s %s.eml", newTime, record.Subject))
+	newPath := filepath.Join(dir, newName)
+	return os.Rename(filePath, newPath)
+}
+
+// renameFileTo는 원본 파일은 그대로 두고, 새 디렉토리에 복사하여 재명명합니다.
+func renameFileTo(filePath, inputRoot, outputDir string, record EmailRecord) error {
+	relPath, err := filepath.Rel(inputRoot, filePath)
+	if err != nil {
+		return err
+	}
+	newTime := formatTime(record.SentDate)
+	newName := sanitizeFilename(fmt.Sprintf("%s %s.eml", newTime, record.Subject))
+	newRelPath := filepath.Join(filepath.Dir(relPath), newName)
+	newPath := filepath.Join(outputDir, newRelPath)
+
+	if err := os.MkdirAll(filepath.Dir(newPath), 0755); err != nil {
+		return err
+	}
+
+	srcFile, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(newPath)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
+}
+
+// formatTime는 "2006-01-02 15:04:05" 형식을 받아 "2006-01-02_150405" 형태로 변환합니다.
+// 시간 부분에서는 하이픈 없이 HHMMSS 형식으로 만듭니다.
+func formatTime(sentDate string) string {
+	if sentDate == "" {
+		return "unknown"
+	}
+	parts := strings.Split(sentDate, " ")
+	if len(parts) >= 2 {
+		datePart := parts[0]
+		timePart := strings.ReplaceAll(parts[1], ":", "") // "15:04:05" -> "150405"
+		return datePart + "_" + timePart
+	}
+	return sentDate
+}
+
+func sanitizeFilename(name string) string {
+	invalidChars := []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|"}
+	for _, char := range invalidChars {
+		name = strings.ReplaceAll(name, char, "_")
+	}
+	return name
+}
+
+func writeHtmlFile(filePath, inputRoot, htmlOutDir, htmlContent string) error {
+	relPath, err := filepath.Rel(inputRoot, filePath)
+	if err != nil {
+		return err
+	}
+	newRelPath := strings.TrimSuffix(relPath, filepath.Ext(relPath)) + ".html"
+	outPath := filepath.Join(htmlOutDir, newRelPath)
+
+	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(outPath, []byte(htmlContent), 0644)
 }
 
 func parseAddress(input string) (string, string) {
@@ -187,7 +307,6 @@ func parseAddress(input string) (string, string) {
 	if err == nil {
 		return addr.Name, addr.Address
 	}
-	// 개선된 정규표현식: 이름과 이메일을 분리하여 추출
 	re := regexp.MustCompile(`(?i)^(?:"?([^"]*)"?\s*)?<?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})>?$`)
 	if match := re.FindStringSubmatch(strings.TrimSpace(input)); len(match) == 3 {
 		name := strings.TrimSpace(match[1])
@@ -206,7 +325,6 @@ func extractUrls(htmlContent string) []string {
 
 	doc, err := html.Parse(strings.NewReader(htmlContent))
 	if err != nil {
-		// HTML 파싱 실패 시 fallback: 정규표현식을 사용하여 URL 추출
 		re := regexp.MustCompile(`https?://[^\s"']+`)
 		matches := re.FindAllString(htmlContent, -1)
 		return matches
@@ -227,7 +345,6 @@ func extractUrls(htmlContent string) []string {
 	}
 	crawler(doc)
 
-	// URL 중복 제거
 	unique := make(map[string]struct{})
 	var result []string
 	for _, u := range urls {
