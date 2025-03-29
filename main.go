@@ -1,4 +1,3 @@
-// 파일명: main.go
 package main
 
 import (
@@ -8,16 +7,57 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/mail"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
-	"github.com/jhillyerd/enmime"
+	// 표준 라이브러리의 net/mail는 별칭 사용
+	stdmail "net/mail"
+
+	messageMail "github.com/emersion/go-message/mail"
 	"golang.org/x/net/html"
+
+	// charset 처리를 위한 패키지
+	"github.com/emersion/go-message"
+	"golang.org/x/net/html/charset" // 별칭 없이 사용
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/encoding/korean"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/traditionalchinese"
+	"golang.org/x/text/transform"
 )
+
+// init 함수에서 message.CharsetReader를 설정하여 EUC-KR 인코딩을 지원합니다.
+func init() {
+	message.CharsetReader = func(cs string, input io.Reader) (io.Reader, error) {
+		switch strings.ToLower(cs) {
+		case "euc-kr", "ks_c_5601-1987":
+			return transform.NewReader(input, korean.EUCKR.NewDecoder()), nil
+		case "iso-8859-1":
+			return transform.NewReader(input, charmap.ISO8859_1.NewDecoder()), nil
+		case "iso-8859-2":
+			return transform.NewReader(input, charmap.ISO8859_2.NewDecoder()), nil
+		case "windows-1252":
+			return transform.NewReader(input, charmap.Windows1252.NewDecoder()), nil
+		case "windows-1251":
+			return transform.NewReader(input, charmap.Windows1251.NewDecoder()), nil
+		case "iso-2022-jp":
+			return transform.NewReader(input, japanese.ISO2022JP.NewDecoder()), nil
+		case "ascii":
+			return input, nil
+		case "gb2312":
+			return transform.NewReader(input, simplifiedchinese.GB18030.NewDecoder()), nil
+		case "big5":
+			return transform.NewReader(input, traditionalchinese.Big5.NewDecoder()), nil
+		default:
+			// 기본 fallback: html/charset 패키지의 NewReaderLabel 사용
+			return charset.NewReaderLabel(cs, input)
+		}
+	}
+}
 
 type EmailRecord struct {
 	URLDomains   string
@@ -34,7 +74,6 @@ type EmailRecord struct {
 }
 
 func main() {
-
 	var jsonOutput bool
 	var csvOutput bool
 	var recursive bool
@@ -115,7 +154,6 @@ func walkDirectory(inputRoot, htmlOutDir string, renameByHeader bool, renameByHe
 					log.Printf("[WARN] HTML 파일 생성 실패: %s (%v)", path, err)
 				}
 			}
-			// 우선순위: rename-by-header-to 옵션이 있으면 그 기능 사용, 없으면 in-place rename
 			if renameByHeaderTo != "" {
 				if err := renameFileTo(path, inputRoot, renameByHeaderTo, record); err != nil {
 					log.Printf("[WARN] 파일 복사 재명명 실패: %s (%v)", path, err)
@@ -171,35 +209,78 @@ func scanDirectoryOnce(inputRoot, htmlOutDir string, renameByHeader bool, rename
 	return records, nil
 }
 
+// processEmlFile는 go-message/mail 라이브러리를 사용하여 EML 파일을 파싱합니다.
 func processEmlFile(filePath string) (EmailRecord, string, error) {
-	file, err := os.Open(filePath)
+	f, err := os.Open(filePath)
 	if err != nil {
 		return EmailRecord{}, "", err
 	}
-	defer file.Close()
+	defer f.Close()
 
-	env, err := enmime.ReadEnvelope(file)
+	// 메시지 리더 생성 (go-message/mail 사용)
+	mr, err := messageMail.CreateReader(f)
 	if err != nil {
 		return EmailRecord{}, "", err
 	}
 
-	header := env.Root.Header
-	fromName, fromEmail := parseAddress(header.Get("From"))
-	toName, toEmail := parseAddress(header.Get("To"))
+	h := mr.Header
 
-	subject := env.GetHeader("Subject")
-	originIP := strings.Trim(header.Get("X-Originating-IP"), "[]")
+	// Subject
+	subject, err := h.Subject()
+	if err != nil {
+		subject = ""
+	}
 
+	// From
+	fromList, err := h.AddressList("From")
+	var fromName, fromEmail string
+	if err == nil && len(fromList) > 0 {
+		fromName = fromList[0].Name
+		fromEmail = fromList[0].Address
+	}
+
+	// To
+	toList, err := h.AddressList("To")
+	var toName, toEmail string
+	if err == nil && len(toList) > 0 {
+		toName = toList[0].Name
+		toEmail = toList[0].Address
+	}
+
+	// Date
+	date, err := h.Date()
 	var sentDate string
-	if dateStr := header.Get("Date"); dateStr != "" {
-		if t, err := mail.ParseDate(dateStr); err == nil {
-			sentDate = t.Format("2006-01-02 15:04:05")
+	if err == nil {
+		sentDate = date.Format("2006-01-02 15:04:05")
+	}
+
+	// X-Originating-IP (없으면 빈 문자열)
+	originIP := h.Get("X-Originating-IP")
+
+	// HTML 본문 추출: 멀티파트인 경우 text/html 파트를 찾습니다.
+	var htmlContent string
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return EmailRecord{}, "", err
+		}
+		ct := p.Header.Get("Content-Type")
+		if strings.HasPrefix(ct, "text/html") {
+			body, err := io.ReadAll(p.Body)
+			if err != nil {
+				continue
+			}
+			htmlContent = string(body)
+			break
 		}
 	}
 
-	urls := extractUrls(env.HTML)
+	urls := extractUrls(htmlContent)
 	urlList := strings.Join(urls, "\n")
-	urlDomains := make([]string, 0)
+	var urlDomains []string
 	for _, u := range urls {
 		if parsed, err := url.Parse(u); err == nil {
 			urlDomains = append(urlDomains, parsed.Host)
@@ -222,7 +303,8 @@ func processEmlFile(filePath string) (EmailRecord, string, error) {
 		URLDomains:   strings.Join(urlDomains, "\n"),
 		OriginalFile: originalFile,
 	}
-	return record, env.HTML, nil
+
+	return record, htmlContent, nil
 }
 
 // renameFile는 원본 파일의 이름을 in-place로 변경합니다.
@@ -266,7 +348,6 @@ func renameFileTo(filePath, inputRoot, outputDir string, record EmailRecord) err
 }
 
 // formatTime는 "2006-01-02 15:04:05" 형식을 받아 "2006-01-02_150405" 형태로 변환합니다.
-// 시간 부분에서는 하이픈 없이 HHMMSS 형식으로 만듭니다.
 func formatTime(sentDate string) string {
 	if sentDate == "" {
 		return "unknown"
@@ -274,7 +355,7 @@ func formatTime(sentDate string) string {
 	parts := strings.Split(sentDate, " ")
 	if len(parts) >= 2 {
 		datePart := parts[0]
-		timePart := strings.ReplaceAll(parts[1], ":", "") // "15:04:05" -> "150405"
+		timePart := strings.ReplaceAll(parts[1], ":", "")
 		return datePart + "_" + timePart
 	}
 	return sentDate
@@ -302,8 +383,9 @@ func writeHtmlFile(filePath, inputRoot, htmlOutDir, htmlContent string) error {
 	return os.WriteFile(outPath, []byte(htmlContent), 0644)
 }
 
+// parseAddress는 stdmail를 사용하여 주소를 파싱합니다.
 func parseAddress(input string) (string, string) {
-	addr, err := mail.ParseAddress(input)
+	addr, err := stdmail.ParseAddress(input)
 	if err == nil {
 		return addr.Name, addr.Address
 	}
